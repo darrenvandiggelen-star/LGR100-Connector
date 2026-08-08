@@ -30,6 +30,8 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Locale;
@@ -43,15 +45,19 @@ public class MainActivity extends Activity {
     private DisplayManager displayManager;
     private UsbDevice headset;
     private TextView status;
+    private TextView sensorStatus;
     private TextView log;
     private Presentation presentation;
     private final Handler handler = new Handler(Looper.getMainLooper());
+
     private volatile boolean activating = false;
     private volatile boolean keepAliveEnabled = false;
+    private volatile boolean sensorStreaming = false;
+    private Thread sensorThread;
 
     private final Runnable keepAliveRunnable = new Runnable() {
         @Override public void run() {
-            if (!keepAliveEnabled || headset == null || !usbManager.hasPermission(headset)) return;
+            if (!keepAliveEnabled || sensorStreaming || headset == null || !usbManager.hasPermission(headset)) return;
             new Thread(() -> sendKeepAliveOnce(), "lgr100-keepalive").start();
             handler.postDelayed(this, 1500);
         }
@@ -79,6 +85,7 @@ public class MainActivity extends Activity {
                 UsbDevice device = getUsbDevice(intent);
                 if (device != null && isLgr100(device)) {
                     append("LGR100 detached");
+                    stopSensorDiagnostics();
                     keepAliveEnabled = false;
                     handler.removeCallbacks(keepAliveRunnable);
                     headset = null;
@@ -104,14 +111,15 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED);
         else registerReceiver(receiver, filter);
 
-        append("LG 360 VR Connector V0.2");
-        append("Target USB ID 1004:6374");
-        append("Wake sequence: drain IN -> Sleep Disable -> VR App Start");
+        append("LG 360 VR Connector V0.3");
+        append("Display orientation corrected from V0.2");
+        append("Sensor diagnostics: gyro + accelerometer + proximity/raw");
         scan();
         refreshStatus();
     }
 
     @Override protected void onDestroy() {
+        stopSensorDiagnostics();
         keepAliveEnabled = false;
         handler.removeCallbacks(keepAliveRunnable);
         try { unregisterReceiver(receiver); } catch (Exception ignored) {}
@@ -122,37 +130,59 @@ public class MainActivity extends Activity {
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(16), dp(16), dp(16), dp(16));
+        root.setPadding(dp(12), dp(12), dp(12), dp(12));
 
         TextView title = new TextView(this);
-        title.setText("LG 360 VR Connector V0.2");
-        title.setTextSize(26);
+        title.setText("LG 360 VR Connector V0.3");
+        title.setTextSize(25);
         title.setTextColor(Color.BLACK);
         root.addView(title);
 
         status = new TextView(this);
-        status.setTextSize(16);
-        status.setPadding(dp(12), dp(12), dp(12), dp(12));
+        status.setTextSize(15);
+        status.setPadding(dp(10), dp(10), dp(10), dp(10));
         root.addView(status);
 
-        Button scan = button("Scan for LGR100");
+        LinearLayout row1 = new LinearLayout(this);
+        row1.setOrientation(LinearLayout.HORIZONTAL);
+        Button scan = button("Scan");
         scan.setOnClickListener(v -> { scan(); refreshStatus(); });
-        root.addView(scan);
-
-        Button permission = button("Request USB permission");
+        row1.addView(scan, weighted());
+        Button permission = button("USB permission");
         permission.setOnClickListener(v -> requestPermission());
-        root.addView(permission);
+        row1.addView(permission, weighted());
+        root.addView(row1);
 
-        Button activate = button("Wake LGR100 (V0.2 sequence)");
+        LinearLayout row2 = new LinearLayout(this);
+        row2.setOrientation(LinearLayout.HORIZONTAL);
+        Button activate = button("Wake headset");
         activate.setOnClickListener(v -> activateHeadset());
-        root.addView(activate);
-
-        Button test = button("Show bright VR test display");
+        row2.addView(activate, weighted());
+        Button test = button("VR test image");
         test.setOnClickListener(v -> showTestDisplay());
-        root.addView(test);
+        row2.addView(test, weighted());
+        root.addView(row2);
+
+        LinearLayout row3 = new LinearLayout(this);
+        row3.setOrientation(LinearLayout.HORIZONTAL);
+        Button sensors = button("Start sensors");
+        sensors.setOnClickListener(v -> startSensorDiagnostics());
+        row3.addView(sensors, weighted());
+        Button stop = button("Stop sensors");
+        stop.setOnClickListener(v -> stopSensorDiagnostics());
+        row3.addView(stop, weighted());
+        root.addView(row3);
+
+        sensorStatus = new TextView(this);
+        sensorStatus.setTextSize(13);
+        sensorStatus.setTextColor(Color.BLACK);
+        sensorStatus.setBackgroundColor(Color.rgb(235, 238, 242));
+        sensorStatus.setPadding(dp(10), dp(10), dp(10), dp(10));
+        sensorStatus.setText("SENSOR CHECK\nNot running\nStart Sensors, then rotate/tilt the headset and cover/uncover the proximity sensor.");
+        root.addView(sensorStatus);
 
         log = new TextView(this);
-        log.setTextSize(12);
+        log.setTextSize(11);
         log.setTextColor(Color.DKGRAY);
         log.setPadding(dp(8), dp(8), dp(8), dp(8));
         ScrollView scroll = new ScrollView(this);
@@ -160,6 +190,10 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
         root.addView(scroll, lp);
         setContentView(root);
+    }
+
+    private LinearLayout.LayoutParams weighted() {
+        return new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
     }
 
     private Button button(String text) {
@@ -218,131 +252,271 @@ public class MainActivity extends Activity {
 
     private void activateHeadset() {
         if (activating) { append("Activation already running"); return; }
+        if (sensorStreaming) { append("Stop sensor diagnostics before running wake sequence again"); return; }
         if (headset == null) scan();
         if (headset == null) { append("Activation stopped: headset not detected"); return; }
         if (!usbManager.hasPermission(headset)) { append("USB permission required first"); requestPermission(); return; }
 
         activating = true;
-        append("=== V0.2 WAKE SEQUENCE START ===");
+        append("=== V0.3 WAKE SEQUENCE START ===");
         new Thread(this::doActivationSequence, "lgr100-activate").start();
     }
 
     private void doActivationSequence() {
         UsbDevice device = headset;
         UsbDeviceConnection connection = usbManager.openDevice(device);
-        if (connection == null) {
-            append("openDevice() failed");
-            activating = false;
-            return;
-        }
+        if (connection == null) { append("openDevice() failed"); activating = false; return; }
 
         UsbInterface hid = null;
-        UsbEndpoint epIn = null;
-        UsbEndpoint epOut = null;
-
         try {
-            for (int i = 0; i < device.getInterfaceCount(); i++) {
-                UsbInterface intf = device.getInterface(i);
-                if (intf.getInterfaceClass() != UsbConstants.USB_CLASS_HID) continue;
-                hid = intf;
-                boolean claimed = connection.claimInterface(intf, true);
-                append("Claim HID interface " + intf.getId() + " = " + claimed);
-                if (!claimed) { hid = null; continue; }
+            EndpointSet set = claimHid(connection, device);
+            hid = set.hid;
+            if (hid == null) { append("No claimable HID interface found"); return; }
 
-                for (int e = 0; e < intf.getEndpointCount(); e++) {
-                    UsbEndpoint ep = intf.getEndpoint(e);
-                    if (ep.getDirection() == UsbConstants.USB_DIR_IN && epIn == null) epIn = ep;
-                    if (ep.getDirection() == UsbConstants.USB_DIR_OUT && epOut == null) epOut = ep;
-                }
-                break;
-            }
+            append("IN endpoint: " + endpointName(set.in));
+            append("OUT endpoint: " + endpointName(set.out));
+            if (set.in != null) drainInput(connection, set.in);
 
-            if (hid == null) {
-                append("No claimable HID interface found");
-                return;
-            }
-            append("IN endpoint: " + (epIn != null ? String.format(Locale.US, "0x%02X", epIn.getAddress()) : "NONE"));
-            append("OUT endpoint: " + (epOut != null ? String.format(Locale.US, "0x%02X", epOut.getAddress()) : "NONE"));
-
-            // Working desktop activators first consume pending input from EP 0x81.
-            if (epIn != null) drainInput(connection, epIn);
-
-            // Sleep Disable prevents the proximity/sleep logic from keeping the LCD dark.
-            boolean sleepOk = sendCommand(connection, hid, epOut, "Sleep Disable");
+            boolean sleepOk = sendCommand(connection, hid, set.out, "Sleep Disable", true);
             sleepQuiet(120);
-            if (epIn != null) readResponse(connection, epIn, "after Sleep Disable");
+            if (set.in != null) readResponse(connection, set.in, "after Sleep Disable");
 
-            // This is the command known to start the display controller.
-            boolean startOk = sendCommand(connection, hid, epOut, "VR App Start");
+            boolean startOk = sendCommand(connection, hid, set.out, "VR App Start", true);
             sleepQuiet(250);
-            if (epIn != null) readResponse(connection, epIn, "after VR App Start");
+            if (set.in != null) readResponse(connection, set.in, "after VR App Start");
 
             append("Sleep Disable sent=" + sleepOk + " | VR App Start sent=" + startOk);
-
             if (sleepOk || startOk) {
                 keepAliveEnabled = true;
                 handler.removeCallbacks(keepAliveRunnable);
                 handler.postDelayed(keepAliveRunnable, 1000);
             }
-
         } catch (Throwable t) {
             append("Activation error: " + t.getClass().getSimpleName() + ": " + t.getMessage());
         } finally {
-            if (hid != null) {
-                try { connection.releaseInterface(hid); } catch (Throwable ignored) {}
-            }
+            if (hid != null) try { connection.releaseInterface(hid); } catch (Throwable ignored) {}
             connection.close();
             activating = false;
         }
 
-        append("=== V0.2 WAKE SEQUENCE COMPLETE ===");
+        append("=== V0.3 WAKE SEQUENCE COMPLETE ===");
         handler.postDelayed(() -> {
             refreshStatus();
             Display d = findExternalDisplay();
-            if (d != null) {
-                appendDisplayInfo(d);
-                showTestDisplay();
-            }
+            if (d != null) { appendDisplayInfo(d); showTestDisplay(); }
         }, 400);
+    }
+
+    private void startSensorDiagnostics() {
+        if (sensorStreaming) { append("Sensor diagnostics already running"); return; }
+        if (activating) { append("Wait for wake sequence to finish first"); return; }
+        if (headset == null) scan();
+        if (headset == null) { append("Sensor test stopped: headset not detected"); return; }
+        if (!usbManager.hasPermission(headset)) { append("USB permission required first"); requestPermission(); return; }
+
+        keepAliveEnabled = false;
+        handler.removeCallbacks(keepAliveRunnable);
+        sensorStreaming = true;
+        setSensorStatus("SENSOR CHECK\nStarting...\nMove/rotate the headset. Cover/uncover the proximity sensor.");
+        append("=== SENSOR DIAGNOSTICS START ===");
+        sensorThread = new Thread(this::runSensorDiagnostics, "lgr100-sensors");
+        sensorThread.start();
+    }
+
+    private void runSensorDiagnostics() {
+        UsbDevice device = headset;
+        UsbDeviceConnection connection = usbManager.openDevice(device);
+        if (connection == null) { append("Sensor openDevice() failed"); sensorStreaming = false; return; }
+
+        UsbInterface hid = null;
+        long packets = 0, imuPackets = 0, otherPackets = 0;
+        long startMs = System.currentTimeMillis();
+        long lastKeepAlive = 0, lastProxQuery = 0, lastUi = 0;
+        String lastOther = "none";
+        int peakGyro = 0, accelSpan = 0;
+        int minAx = Integer.MAX_VALUE, maxAx = Integer.MIN_VALUE;
+        int minAy = Integer.MAX_VALUE, maxAy = Integer.MIN_VALUE;
+        int minAz = Integer.MAX_VALUE, maxAz = Integer.MIN_VALUE;
+
+        try {
+            EndpointSet set = claimHid(connection, device);
+            hid = set.hid;
+            if (hid == null || set.in == null) { append("Sensor test requires a claimable HID interface and IN endpoint"); return; }
+
+            drainInput(connection, set.in);
+            sendCommand(connection, hid, set.out, "Sleep Disable", false);
+            sleepQuiet(80);
+            sendCommand(connection, hid, set.out, "VR App Start", false);
+            sleepQuiet(100);
+
+            boolean accelOn = sendCommand(connection, hid, set.out, "Accel On", true);
+            sleepQuiet(60);
+            boolean gyroOn = sendCommand(connection, hid, set.out, "Gyro On", true);
+            sleepQuiet(60);
+            boolean proxOn = sendCommand(connection, hid, set.out, "Proximity On", true);
+            sleepQuiet(80);
+            append("Sensor enable results: Accel=" + accelOn + " Gyro=" + gyroOn + " Proximity=" + proxOn);
+            append("Expecting IMU report 0x05 on endpoint " + endpointName(set.in));
+
+            byte[] buffer = new byte[Math.max(64, set.in.getMaxPacketSize())];
+            while (sensorStreaming && headset != null) {
+                long now = System.currentTimeMillis();
+
+                if (now - lastKeepAlive >= 1400) {
+                    writePrimary(connection, set.out, "Sleep Disable");
+                    lastKeepAlive = now;
+                }
+                if (now - lastProxQuery >= 1200) {
+                    writePrimary(connection, set.out, "Proximity Get Data");
+                    lastProxQuery = now;
+                }
+
+                int n = connection.bulkTransfer(set.in, buffer, buffer.length, 120);
+                if (n <= 0) continue;
+                packets++;
+                int reportId = buffer[0] & 0xFF;
+
+                if (reportId == 0x05 && n >= 13) {
+                    imuPackets++;
+                    short gx = le16(buffer, 1), gy = le16(buffer, 3), gz = le16(buffer, 5);
+                    short ax = le16(buffer, 7), ay = le16(buffer, 9), az = le16(buffer, 11);
+
+                    peakGyro = Math.max(peakGyro, Math.max(Math.abs((int) gx), Math.max(Math.abs((int) gy), Math.abs((int) gz))));
+                    minAx = Math.min(minAx, ax); maxAx = Math.max(maxAx, ax);
+                    minAy = Math.min(minAy, ay); maxAy = Math.max(maxAy, ay);
+                    minAz = Math.min(minAz, az); maxAz = Math.max(maxAz, az);
+                    accelSpan = Math.max(maxAx - minAx, Math.max(maxAy - minAy, maxAz - minAz));
+
+                    if (now - lastUi >= 120) {
+                        double gxDps = gx / 131.0, gyDps = gy / 131.0, gzDps = gz / 131.0;
+                        double axG = ax / 16384.0, ayG = ay / 16384.0, azG = az / 16384.0;
+                        double gyroMag = Math.sqrt(gxDps * gxDps + gyDps * gyDps + gzDps * gzDps);
+                        double accelMag = Math.sqrt(axG * axG + ayG * ayG + azG * azG);
+                        String gyroCheck = peakGyro > 80 ? "PASS - motion detected" : "WAIT - rotate headset";
+                        String accelCheck = accelSpan > 500 ? "PASS - tilt/motion detected" : "WAIT - tilt headset";
+                        String unknown = n > 13 ? hexRange(buffer, 13, Math.min(n, 31)) : "none";
+                        double seconds = Math.max(0.001, (now - startMs) / 1000.0);
+                        double rate = imuPackets / seconds;
+
+                        String text = String.format(Locale.US,
+                                "SENSOR CHECK - LIVE\n" +
+                                "IMU report: 0x%02X | packets: %d | %.1f Hz\n" +
+                                "GYRO raw:  X=%6d  Y=%6d  Z=%6d\n" +
+                                "GYRO approx: X=%7.1f Y=%7.1f Z=%7.1f deg/s | mag=%.1f\n" +
+                                "Gyro check: %s\n\n" +
+                                "ACCEL raw: X=%6d  Y=%6d  Z=%6d\n" +
+                                "ACCEL approx: X=%6.3f Y=%6.3f Z=%6.3f g | mag=%.3f g\n" +
+                                "Accel check: %s\n\n" +
+                                "PROXIMITY: query active; cover/uncover center sensor\n" +
+                                "Raw sensor tail: %s\n" +
+                                "Other USB response: %s\n" +
+                                "Other packets: %d",
+                                reportId, imuPackets, rate,
+                                (int) gx, (int) gy, (int) gz,
+                                gxDps, gyDps, gzDps, gyroMag, gyroCheck,
+                                (int) ax, (int) ay, (int) az,
+                                axG, ayG, azG, accelMag, accelCheck,
+                                unknown, lastOther, otherPackets);
+                        setSensorStatus(text);
+                        lastUi = now;
+                    }
+                } else {
+                    otherPackets++;
+                    lastOther = "ID 0x" + String.format(Locale.US, "%02X", reportId) + " (" + n + "B): " + hex(buffer, Math.min(n, 32));
+                    if (otherPackets <= 12 || otherPackets % 20 == 0) append("Sensor/non-IMU packet: " + lastOther);
+                }
+            }
+        } catch (Throwable t) {
+            append("Sensor error: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            setSensorStatus("SENSOR CHECK\nERROR: " + t.getMessage());
+        } finally {
+            if (hid != null) {
+                try {
+                    EndpointSet set = endpointsOnly(device, hid);
+                    if (set.out != null) {
+                        writePrimary(connection, set.out, "Accel Off");
+                        writePrimary(connection, set.out, "Gyro Off");
+                        writePrimary(connection, set.out, "Proximity Off");
+                        writePrimary(connection, set.out, "Sleep Disable");
+                    }
+                } catch (Throwable ignored) {}
+                try { connection.releaseInterface(hid); } catch (Throwable ignored) {}
+            }
+            connection.close();
+            sensorStreaming = false;
+            append("=== SENSOR DIAGNOSTICS STOPPED === packets=" + packets + " imu=" + imuPackets);
+            if (headset != null && usbManager.hasPermission(headset)) {
+                keepAliveEnabled = true;
+                handler.postDelayed(keepAliveRunnable, 700);
+            }
+        }
+    }
+
+    private void stopSensorDiagnostics() {
+        if (!sensorStreaming) return;
+        sensorStreaming = false;
+        append("Stopping sensor diagnostics...");
+        Thread t = sensorThread;
+        if (t != null) t.interrupt();
+    }
+
+    private EndpointSet claimHid(UsbDeviceConnection connection, UsbDevice device) {
+        for (int i = 0; i < device.getInterfaceCount(); i++) {
+            UsbInterface intf = device.getInterface(i);
+            if (intf.getInterfaceClass() != UsbConstants.USB_CLASS_HID) continue;
+            boolean claimed = connection.claimInterface(intf, true);
+            append("Claim HID interface " + intf.getId() + " = " + claimed);
+            if (!claimed) continue;
+            return endpointsOnly(device, intf);
+        }
+        return new EndpointSet(null, null, null);
+    }
+
+    private EndpointSet endpointsOnly(UsbDevice device, UsbInterface intf) {
+        UsbEndpoint in = null, out = null;
+        for (int e = 0; e < intf.getEndpointCount(); e++) {
+            UsbEndpoint ep = intf.getEndpoint(e);
+            if (ep.getDirection() == UsbConstants.USB_DIR_IN && in == null) in = ep;
+            if (ep.getDirection() == UsbConstants.USB_DIR_OUT && out == null) out = ep;
+        }
+        return new EndpointSet(intf, in, out);
     }
 
     private void drainInput(UsbDeviceConnection connection, UsbEndpoint epIn) {
         byte[] buffer = new byte[Math.max(64, epIn.getMaxPacketSize())];
-        int packets = 0;
-        int bytes = 0;
+        int packets = 0, bytes = 0;
         for (int i = 0; i < 32; i++) {
-            int n = connection.bulkTransfer(epIn, buffer, buffer.length, 40);
+            int n = connection.bulkTransfer(epIn, buffer, buffer.length, 35);
             if (n <= 0) break;
-            packets++;
-            bytes += n;
+            packets++; bytes += n;
             if (packets <= 4) append("Drain IN packet " + packets + ": " + hex(buffer, n));
         }
         append("Drained IN endpoint: packets=" + packets + " bytes=" + bytes);
     }
 
-    private boolean sendCommand(UsbDeviceConnection connection, UsbInterface hid, UsbEndpoint epOut, String command) {
+    private boolean sendCommand(UsbDeviceConnection connection, UsbInterface hid, UsbEndpoint epOut, String command, boolean verbose) {
         byte[] payload = buildCommand(command);
-        append("SEND " + command + " -> " + hex(payload, payload.length));
-        boolean ok = false;
+        if (verbose) append("SEND " + command + " -> " + hex(payload, payload.length));
 
-        // Primary path: exact raw HID packet to interrupt OUT EP 0x01, matching known working tools.
         if (epOut != null) {
-            int out = connection.bulkTransfer(epOut, payload, payload.length, 1500);
-            append("  OUT endpoint result=" + out + "/" + payload.length);
-            if (out == payload.length) ok = true;
+            int out = connection.bulkTransfer(epOut, payload, payload.length, 1000);
+            if (verbose) append("  OUT endpoint result=" + out + "/" + payload.length);
+            if (out == payload.length) return true;
         }
 
-        // Fallback A: HID feature Set_Report, report ID 0. Used by libusb implementations.
-        int feature = connection.controlTransfer(0x21, 0x09, 0x0300, hid.getId(), payload, payload.length, 1500);
-        append("  SET_REPORT feature/id0 result=" + feature);
-        if (feature == payload.length) ok = true;
+        int feature = connection.controlTransfer(0x21, 0x09, 0x0300, hid.getId(), payload, payload.length, 1000);
+        if (verbose) append("  SET_REPORT feature/id0 result=" + feature);
+        if (feature == payload.length) return true;
 
-        // Fallback B: output Set_Report with report ID 3 (kept for Android/HID variants).
-        int output = connection.controlTransfer(0x21, 0x09, 0x0203, hid.getId(), payload, payload.length, 1500);
-        append("  SET_REPORT output/id3 result=" + output);
-        if (output == payload.length) ok = true;
+        int output = connection.controlTransfer(0x21, 0x09, 0x0203, hid.getId(), payload, payload.length, 1000);
+        if (verbose) append("  SET_REPORT output/id3 result=" + output);
+        return output == payload.length;
+    }
 
-        return ok;
+    private int writePrimary(UsbDeviceConnection connection, UsbEndpoint epOut, String command) {
+        if (epOut == null) return -1;
+        byte[] payload = buildCommand(command);
+        return connection.bulkTransfer(epOut, payload, payload.length, 700);
     }
 
     private byte[] buildCommand(String command) {
@@ -363,49 +537,19 @@ public class MainActivity extends Activity {
 
     private void sendKeepAliveOnce() {
         UsbDevice device = headset;
-        if (device == null || !usbManager.hasPermission(device)) return;
+        if (device == null || sensorStreaming || !usbManager.hasPermission(device)) return;
         UsbDeviceConnection connection = usbManager.openDevice(device);
         if (connection == null) return;
         UsbInterface hid = null;
         try {
-            for (int i = 0; i < device.getInterfaceCount(); i++) {
-                UsbInterface intf = device.getInterface(i);
-                if (intf.getInterfaceClass() != UsbConstants.USB_CLASS_HID) continue;
-                if (!connection.claimInterface(intf, true)) continue;
-                hid = intf;
-                UsbEndpoint out = null;
-                for (int e = 0; e < intf.getEndpointCount(); e++) {
-                    UsbEndpoint ep = intf.getEndpoint(e);
-                    if (ep.getDirection() == UsbConstants.USB_DIR_OUT) { out = ep; break; }
-                }
-                byte[] payload = buildCommand("Sleep Disable");
-                int result = out != null ? connection.bulkTransfer(out, payload, payload.length, 750) : -1;
-                if (result != payload.length) {
-                    result = connection.controlTransfer(0x21, 0x09, 0x0300, intf.getId(), payload, payload.length, 750);
-                }
-                break;
-            }
+            EndpointSet set = claimHid(connection, device);
+            hid = set.hid;
+            if (hid != null) writePrimary(connection, set.out, "Sleep Disable");
         } catch (Throwable ignored) {
         } finally {
-            if (hid != null) {
-                try { connection.releaseInterface(hid); } catch (Throwable ignored) {}
-            }
+            if (hid != null) try { connection.releaseInterface(hid); } catch (Throwable ignored) {}
             connection.close();
         }
-    }
-
-    private String hex(byte[] data, int length) {
-        StringBuilder sb = new StringBuilder();
-        int count = Math.min(length, data.length);
-        for (int i = 0; i < count; i++) {
-            if (i > 0) sb.append(' ');
-            sb.append(String.format(Locale.US, "%02X", data[i] & 0xFF));
-        }
-        return sb.toString();
-    }
-
-    private void sleepQuiet(long ms) {
-        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
     private Display findExternalDisplay() {
@@ -415,47 +559,86 @@ public class MainActivity extends Activity {
         return null;
     }
 
-    private void appendDisplayInfo(Display d) {
-        Display.Mode mode = d.getMode();
-        append(String.format(Locale.US,
-                "External display: name=%s id=%d mode=%dx%d @ %.2fHz rotation=%d state=%d",
-                d.getName(), d.getDisplayId(), mode.getPhysicalWidth(), mode.getPhysicalHeight(), mode.getRefreshRate(), d.getRotation(), d.getState()));
-    }
-
     private void showTestDisplay() {
         Display d = findExternalDisplay();
         if (d == null) { append("No external Android display detected"); refreshStatus(); return; }
         if (presentation != null) presentation.dismiss();
         presentation = new Presentation(this, d);
-        presentation.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         presentation.setContentView(new TestPatternView(presentation.getContext()));
         presentation.show();
+        append("Corrected-orientation test image shown on " + d.getName());
         appendDisplayInfo(d);
-        append("Bright test image shown on " + d.getName());
+    }
+
+    private void appendDisplayInfo(Display d) {
+        Display.Mode mode = d.getMode();
+        append(String.format(Locale.US, "External display: %s %dx%d @ %.2f Hz (displayId=%d)", d.getName(), mode.getPhysicalWidth(), mode.getPhysicalHeight(), mode.getRefreshRate(), d.getDisplayId()));
     }
 
     private void refreshStatus() {
         boolean detected = headset != null;
         boolean permission = detected && usbManager.hasPermission(headset);
         Display ext = findExternalDisplay();
-        status.setText((detected ? "LGR100 DETECTED" : "LGR100 NOT DETECTED") + "\n" +
-                (permission ? "USB permission OK" : "USB permission needed") + " • " +
-                (ext != null ? "External display: " + ext.getName() : "No external display") + "\n" +
-                (keepAliveEnabled ? "V0.2 keep-alive ACTIVE" : "V0.2 keep-alive inactive"));
-        status.setTextColor(Color.WHITE);
-        status.setBackgroundColor(detected ? Color.rgb(30, 130, 80) : Color.rgb(90, 95, 105));
+        String sensor = sensorStreaming ? " • Sensors LIVE" : "";
+        runOnUiThread(() -> {
+            status.setText((detected ? "LGR100 DETECTED" : "LGR100 NOT DETECTED") + "\n" + (permission ? "USB permission OK" : "USB permission needed") + " • " + (ext != null ? "External display: " + ext.getName() : "No external display") + sensor);
+            status.setTextColor(Color.WHITE);
+            status.setBackgroundColor(detected ? Color.rgb(30, 130, 80) : Color.rgb(90, 95, 105));
+        });
+    }
+
+    private short le16(byte[] data, int offset) {
+        return ByteBuffer.wrap(data, offset, 2).order(ByteOrder.LITTLE_ENDIAN).getShort();
+    }
+
+    private String endpointName(UsbEndpoint ep) {
+        return ep == null ? "NONE" : String.format(Locale.US, "0x%02X", ep.getAddress());
+    }
+
+    private String hex(byte[] data, int length) {
+        StringBuilder sb = new StringBuilder();
+        int n = Math.min(length, data.length);
+        for (int i = 0; i < n; i++) {
+            if (i > 0) sb.append(' ');
+            sb.append(String.format(Locale.US, "%02X", data[i] & 0xFF));
+        }
+        return sb.toString();
+    }
+
+    private String hexRange(byte[] data, int from, int toExclusive) {
+        StringBuilder sb = new StringBuilder();
+        int end = Math.min(toExclusive, data.length);
+        for (int i = Math.max(0, from); i < end; i++) {
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(String.format(Locale.US, "%02X", data[i] & 0xFF));
+        }
+        return sb.length() == 0 ? "none" : sb.toString();
+    }
+
+    private void sleepQuiet(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
     }
 
     private void append(String message) {
-        handler.post(() -> {
-            if (log != null) log.append(message + "\n");
-        });
+        runOnUiThread(() -> { if (log != null) log.append(message + "\n"); });
+    }
+
+    private void setSensorStatus(String text) {
+        runOnUiThread(() -> { if (sensorStatus != null) sensorStatus.setText(text); });
+        refreshStatus();
     }
 
     @SuppressWarnings("deprecation")
     private UsbDevice getUsbDevice(Intent intent) {
         if (Build.VERSION.SDK_INT >= 33) return intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice.class);
         return intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+    }
+
+    private static class EndpointSet {
+        final UsbInterface hid;
+        final UsbEndpoint in;
+        final UsbEndpoint out;
+        EndpointSet(UsbInterface hid, UsbEndpoint in, UsbEndpoint out) { this.hid = hid; this.in = in; this.out = out; }
     }
 
     private static class TestPatternView extends View {
@@ -466,29 +649,33 @@ public class MainActivity extends Activity {
             int w = getWidth();
             int h = getHeight();
             float mid = w / 2f;
-            c.drawColor(Color.WHITE);
-
+            c.drawColor(Color.BLACK);
             paint.setStyle(Paint.Style.FILL);
-            paint.setColor(Color.RED);
+            paint.setColor(Color.rgb(220, 30, 30));
             c.drawRect(0, 0, mid, h, paint);
-            paint.setColor(Color.GREEN);
+            paint.setColor(Color.rgb(25, 190, 70));
             c.drawRect(mid, 0, w, h, paint);
-
-            paint.setColor(Color.WHITE);
             paint.setTextAlign(Paint.Align.CENTER);
-            paint.setTextSize(Math.max(24, Math.min(w, h) / 10f));
-            c.save();
-            c.rotate(-90, mid / 2f, h / 2f);
-            c.drawText("LEFT V0.2", mid / 2f, h / 2f, paint);
-            c.restore();
-            c.save();
-            c.rotate(90, mid + mid / 2f, h / 2f);
-            c.drawText("RIGHT V0.2", mid + mid / 2f, h / 2f, paint);
-            c.restore();
+            paint.setColor(Color.WHITE);
+            paint.setTextSize(Math.max(28, Math.min(w, h) / 11f));
+            paint.setFakeBoldText(true);
+            drawEye(c, 0, mid, h, "LEFT", 90f);
+            drawEye(c, mid, w, h, "RIGHT", -90f);
+            paint.setFakeBoldText(false);
+        }
 
-            paint.setColor(Color.BLACK);
-            paint.setStrokeWidth(Math.max(2, Math.min(w, h) / 200f));
-            c.drawLine(mid, 0, mid, h, paint);
+        private void drawEye(Canvas c, float left, float right, float height, String label, float rotation) {
+            float cx = (left + right) / 2f;
+            float cy = height / 2f;
+            c.save();
+            c.clipRect(left, 0, right, height);
+            c.rotate(rotation, cx, cy);
+            c.drawText(label, cx, cy, paint);
+            float original = paint.getTextSize();
+            paint.setTextSize(Math.max(20, original * 0.55f));
+            c.drawText("UP ^", cx, cy - Math.max(55, height * 0.16f), paint);
+            paint.setTextSize(original);
+            c.restore();
         }
     }
 }
