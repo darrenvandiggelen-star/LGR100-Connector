@@ -14,6 +14,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Apply V0.5 source fixes
+        run: python3 tools/patch_v05.py
+
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -40,12 +43,12 @@ jobs:
       - name: Rename APK
         run: |
           mkdir -p apk-output
-          cp app/build/outputs/apk/debug/app-debug.apk apk-output/LGR100-Connector-V0.4-debug.apk
+          cp app/build/outputs/apk/debug/app-debug.apk apk-output/LGR100-Connector-V0.5-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: LGR100-Connector-V0.4-APK
-          path: apk-output/LGR100-Connector-V0.4-debug.apk
+          name: LGR100-Connector-V0.5-APK
+          path: apk-output/LGR100-Connector-V0.5-debug.apk
           if-no-files-found: error
           retention-days: 30
