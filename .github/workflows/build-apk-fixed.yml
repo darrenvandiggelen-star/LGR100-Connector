@@ -1,0 +1,110 @@
+Library
+/
+build-apk-fixed.yml
+
+
+name: Build LGR100 APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "master" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    name: Compile debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android API 35
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      # IMPORTANT: unpack the Android project BEFORE setup-gradle runs.
+      # setup-gradle v6 basic caching hashes *.gradle* files during setup.
+      - name: Locate and unpack project
+        shell: bash
+        run: |
+          set -e
+
+          if [ -f "settings.gradle" ]; then
+            PROJECT_DIR="."
+          elif [ -f "LGR100_Source.zip" ]; then
+            rm -rf _lgr100_source
+            mkdir -p _lgr100_source
+            unzip -q "LGR100_Source.zip" -d _lgr100_source
+
+            SETTINGS_FILE="$(find _lgr100_source -type f -name settings.gradle -print -quit)"
+            if [ -z "$SETTINGS_FILE" ]; then
+              echo "ERROR: settings.gradle was not found inside LGR100_Source.zip"
+              echo "ZIP contents:"
+              unzip -l "LGR100_Source.zip"
+              exit 1
+            fi
+
+            PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+          else
+            echo "ERROR: LGR100_Source.zip was not found in the repository root."
+            echo "Repository files:"
+            find . -maxdepth 2 -type f -print
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Android project found at: $PROJECT_DIR"
+          find "$PROJECT_DIR" -maxdepth 2 -type f -print
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "8.9"
+          cache-provider: basic
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Prepare downloadable APK
+        shell: bash
+        run: |
+          set -e
+          mkdir -p apk-output
+
+          APK="$(find "$PROJECT_DIR/app/build/outputs/apk/debug" -type f -name '*.apk' -print -quit)"
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: Build completed but no APK was found."
+            find "$PROJECT_DIR/app/build" -type f -print || true
+            exit 1
+          fi
+
+          cp "$APK" "apk-output/LGR100-Connector-V0.1-debug.apk"
+          ls -lh apk-output/
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LGR100-Connector-APK
+          path: apk-output/LGR100-Connector-V0.1-debug.apk
+          if-no-files-found: error
+          retention-days: 30
