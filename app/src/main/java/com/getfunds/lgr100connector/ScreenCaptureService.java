@@ -50,10 +50,28 @@ public class ScreenCaptureService extends Service {
         return captureActive;
     }
 
-    public static boolean drawLatestFrame(Canvas canvas, RectF dst, Paint paint) {
+    public static boolean drawLatestFrame(Canvas canvas, RectF bounds, Paint paint) {
         synchronized (FRAME_LOCK) {
             if (latestFrame == null || latestFrame.isRecycled()) return false;
-            canvas.drawBitmap(latestFrame, null, dst, paint);
+
+            // V0.5: FIT_CENTER rather than stretching/cropping the phone image to the eye box.
+            // This guarantees the whole captured phone screen remains visible with black bars where needed.
+            float srcW = latestFrame.getWidth();
+            float srcH = latestFrame.getHeight();
+            if (srcW <= 0 || srcH <= 0 || bounds.width() <= 0 || bounds.height() <= 0) return false;
+
+            float scale = Math.min(bounds.width() / srcW, bounds.height() / srcH);
+            float drawW = srcW * scale;
+            float drawH = srcH * scale;
+            float cx = bounds.centerX();
+            float cy = bounds.centerY();
+            RectF fitted = new RectF(
+                    cx - drawW / 2f,
+                    cy - drawH / 2f,
+                    cx + drawW / 2f,
+                    cy + drawH / 2f);
+
+            canvas.drawBitmap(latestFrame, null, fitted, paint);
             return true;
         }
     }
