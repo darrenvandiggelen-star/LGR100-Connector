@@ -21,8 +21,6 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
-import android.util.DisplayMetrics;
-import android.view.Display;
 import android.view.Surface;
 
 public class ScreenCaptureService extends Service {
@@ -34,9 +32,6 @@ public class ScreenCaptureService extends Service {
 
     private static final String CHANNEL_ID = "lgr100_screen_share";
     private static final int NOTIFICATION_ID = 360;
-
-    // The headset is 960x720 per eye. Capturing above this for a fitted 2D game plane
-    // only wastes bandwidth and GPU/CPU time, especially on ultra-wide phone screens.
     private static final int MAX_CAPTURE_LONG_EDGE = 960;
 
     private static final Object INSTANCE_LOCK = new Object();
@@ -51,39 +46,22 @@ public class ScreenCaptureService extends Service {
     private VirtualDisplay virtualDisplay;
     private HandlerThread captureThread;
     private Handler captureHandler;
-    private DisplayManager displayManager;
-    private DisplayManager.DisplayListener displayListener;
-
     private int width;
     private int height;
     private int density;
-
     private SurfaceTexture gpuTexture;
     private Surface gpuSurface;
     private ImageReader fallbackReader;
 
-    private final Runnable reconfigureRunnable = this::reconfigureForCurrentPhoneDisplay;
-
-    public static boolean isCaptureActive() {
-        return captureActive;
-    }
-
-    public static boolean isGpuCaptureActive() {
-        return gpuCaptureActive;
-    }
-
-    public static int getCaptureWidth() {
-        return captureWidth;
-    }
-
-    public static int getCaptureHeight() {
-        return captureHeight;
-    }
+    public static boolean isCaptureActive() { return captureActive; }
+    public static boolean isGpuCaptureActive() { return gpuCaptureActive; }
+    public static int getCaptureWidth() { return captureWidth; }
+    public static int getCaptureHeight() { return captureHeight; }
 
     /**
-     * Called by the OpenGL renderer in the external-display Presentation. The MediaProjection
-     * producer then writes straight into this SurfaceTexture. No ImageReader -> ByteBuffer ->
-     * Bitmap copy is needed in gaming mode.
+     * The external-display GL renderer owns the SurfaceTexture and calls this after setting its
+     * buffer size on the GL thread. The service only wraps it in a Surface and hands that Surface
+     * to MediaProjection. This avoids cross-thread SurfaceTexture resize races.
      */
     public static void attachGpuSurface(SurfaceTexture texture) {
         if (texture == null) return;
@@ -105,7 +83,7 @@ public class ScreenCaptureService extends Service {
         if (service != null) service.postDetachGpuSurface(texture);
     }
 
-    /** Legacy Canvas fallback kept only so older generated views still compile. V1.1 uses GL. */
+    /** Legacy Canvas method retained so older generated fallback code still compiles. */
     public static boolean drawLatestFrame(Canvas canvas, RectF bounds, Paint paint) {
         return false;
     }
@@ -113,26 +91,12 @@ public class ScreenCaptureService extends Service {
     @Override public void onCreate() {
         super.onCreate();
         createNotificationChannel();
-
         captureThread = new HandlerThread("lgr100-gpu-capture");
         captureThread.start();
         captureHandler = new Handler(captureThread.getLooper());
-        displayManager = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
-
         synchronized (INSTANCE_LOCK) {
             activeInstance = this;
         }
-
-        displayListener = new DisplayManager.DisplayListener() {
-            @Override public void onDisplayAdded(int displayId) {}
-            @Override public void onDisplayRemoved(int displayId) {}
-            @Override public void onDisplayChanged(int displayId) {
-                if (displayId != Display.DEFAULT_DISPLAY || captureHandler == null || mediaProjection == null) return;
-                captureHandler.removeCallbacks(reconfigureRunnable);
-                captureHandler.postDelayed(reconfigureRunnable, 120);
-            }
-        };
-        displayManager.registerDisplayListener(displayListener, captureHandler);
     }
 
     @Override @SuppressWarnings("deprecation")
@@ -149,8 +113,8 @@ public class ScreenCaptureService extends Service {
         if (Build.VERSION.SDK_INT >= 33) resultData = intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent.class);
         else resultData = intent.getParcelableExtra(EXTRA_RESULT_DATA);
 
-        int requestedW = Math.max(2, intent.getIntExtra(EXTRA_WIDTH, 720));
-        int requestedH = Math.max(2, intent.getIntExtra(EXTRA_HEIGHT, 1280));
+        int requestedW = Math.max(2, intent.getIntExtra(EXTRA_WIDTH, 960));
+        int requestedH = Math.max(2, intent.getIntExtra(EXTRA_HEIGHT, 436));
         int[] fitted = fitCaptureSize(requestedW, requestedH);
         width = fitted[0];
         height = fitted[1];
@@ -181,11 +145,12 @@ public class ScreenCaptureService extends Service {
             }
         }, captureHandler);
 
-        // Start with a drain-only surface. The external GL renderer normally replaces this
-        // within a few hundred milliseconds. This avoids depending on null-Surface behaviour.
+        // Fixed game geometry for the entire capture session. V1.1 resized the producer while
+        // COD was rotating into landscape, which can stall a SurfaceTexture/VirtualDisplay queue
+        // on some devices. The V1.2 caller supplies the phone's landscape aspect from the start.
         fallbackReader = makeDrainReader(width, height);
         virtualDisplay = mediaProjection.createVirtualDisplay(
-                "LGR100 GPU Phone Capture",
+                "LGR100 GPU Game Capture",
                 width,
                 height,
                 density,
@@ -205,7 +170,6 @@ public class ScreenCaptureService extends Service {
             pending = pendingGpuTexture;
         }
         if (pending != null) postAttachGpuSurface(pending);
-        captureHandler.postDelayed(reconfigureRunnable, 180);
         return START_NOT_STICKY;
     }
 
@@ -213,7 +177,6 @@ public class ScreenCaptureService extends Service {
         int w = Math.max(2, rawW);
         int h = Math.max(2, rawH);
         float scale = Math.min(1.0f, MAX_CAPTURE_LONG_EDGE / (float) Math.max(w, h));
-        // Keep dimensions even for broad Surface/encoder compatibility.
         int outW = Math.max(2, (Math.round(w * scale) / 2) * 2);
         int outH = Math.max(2, (Math.round(h * scale) / 2) * 2);
         return new int[]{outW, outH};
@@ -251,7 +214,8 @@ public class ScreenCaptureService extends Service {
         releaseGpuSurfaceOnly();
         gpuTexture = texture;
         try {
-            gpuTexture.setDefaultBufferSize(width, height);
+            // Do not call texture.setDefaultBufferSize() here. The GL owner already did that on
+            // its rendering thread, preventing a race with updateTexImage().
             gpuSurface = new Surface(gpuTexture);
             virtualDisplay.setSurface(gpuSurface);
             gpuCaptureActive = true;
@@ -292,65 +256,18 @@ public class ScreenCaptureService extends Service {
         try {
             fallbackReader = makeDrainReader(width, height);
             virtualDisplay.setSurface(fallbackReader.getSurface());
-        } catch (Throwable ignored) {
-        }
-    }
-
-    @SuppressWarnings("deprecation")
-    private void reconfigureForCurrentPhoneDisplay() {
-        if (virtualDisplay == null || mediaProjection == null || displayManager == null) return;
-        Display phone = displayManager.getDisplay(Display.DEFAULT_DISPLAY);
-        if (phone == null) return;
-
-        DisplayMetrics dm = new DisplayMetrics();
-        phone.getRealMetrics(dm);
-        if (dm.widthPixels <= 1 || dm.heightPixels <= 1) return;
-
-        int[] fitted = fitCaptureSize(dm.widthPixels, dm.heightPixels);
-        int newW = fitted[0];
-        int newH = fitted[1];
-        int newDensity = Math.max(120, dm.densityDpi);
-        if (newW == width && newH == height && newDensity == density) return;
-
-        try {
-            width = newW;
-            height = newH;
-            density = newDensity;
-            publishCaptureSize();
-
-            if (gpuTexture != null) gpuTexture.setDefaultBufferSize(width, height);
-            virtualDisplay.resize(width, height, density);
-
-            // If GL is not attached, the drain reader must match the new geometry.
-            if (gpuTexture == null) {
-                ImageReader old = fallbackReader;
-                fallbackReader = makeDrainReader(width, height);
-                virtualDisplay.setSurface(fallbackReader.getSurface());
-                if (old != null) {
-                    try { old.close(); } catch (Throwable ignored) {}
-                }
-            }
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) {}
     }
 
     @Override public void onDestroy() {
         captureActive = false;
         gpuCaptureActive = false;
-
         synchronized (INSTANCE_LOCK) {
             if (activeInstance == this) activeInstance = null;
         }
-
-        if (displayManager != null && displayListener != null) {
-            try { displayManager.unregisterDisplayListener(displayListener); } catch (Throwable ignored) {}
-        }
-        if (captureHandler != null) captureHandler.removeCallbacks(reconfigureRunnable);
         stopProjectionObjects();
-
         captureWidth = 0;
         captureHeight = 0;
-
         if (captureThread != null) {
             captureThread.quitSafely();
             captureThread = null;
@@ -362,7 +279,6 @@ public class ScreenCaptureService extends Service {
     private void releaseDisplayObjects() {
         captureActive = false;
         gpuCaptureActive = false;
-
         if (virtualDisplay != null) {
             try { virtualDisplay.setSurface(null); } catch (Throwable ignored) {}
             try { virtualDisplay.release(); } catch (Throwable ignored) {}
@@ -402,13 +318,11 @@ public class ScreenCaptureService extends Service {
                 : new Notification.Builder(this);
         return builder
                 .setContentTitle("LG 360 VR")
-                .setContentText("GPU VR game screen is active")
+                .setContentText("Persistent VR game capture is active")
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setOngoing(true)
                 .build();
     }
 
-    @Override public IBinder onBind(Intent intent) {
-        return null;
-    }
+    @Override public IBinder onBind(Intent intent) { return null; }
 }
