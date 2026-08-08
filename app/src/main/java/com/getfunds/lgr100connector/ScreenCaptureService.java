@@ -10,6 +10,7 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
@@ -21,6 +22,8 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.util.DisplayMetrics;
+import android.view.Display;
 
 import java.nio.ByteBuffer;
 
@@ -34,8 +37,11 @@ public class ScreenCaptureService extends Service {
     private static final String CHANNEL_ID = "lgr100_screen_share";
     private static final int NOTIFICATION_ID = 360;
     private static final Object FRAME_LOCK = new Object();
+    private static final int MAX_CAPTURE_LONG_EDGE = 1440;
 
     private static Bitmap latestFrame;
+    private static int latestContentWidth;
+    private static int latestContentHeight;
     private static volatile boolean captureActive = false;
 
     private MediaProjection mediaProjection;
@@ -43,8 +49,13 @@ public class ScreenCaptureService extends Service {
     private ImageReader imageReader;
     private HandlerThread captureThread;
     private Handler captureHandler;
+    private DisplayManager displayManager;
+    private DisplayManager.DisplayListener displayListener;
     private int width;
     private int height;
+    private int density;
+
+    private final Runnable reconfigureRunnable = this::reconfigureForCurrentPhoneDisplay;
 
     public static boolean isCaptureActive() {
         return captureActive;
@@ -53,13 +64,11 @@ public class ScreenCaptureService extends Service {
     public static boolean drawLatestFrame(Canvas canvas, RectF bounds, Paint paint) {
         synchronized (FRAME_LOCK) {
             if (latestFrame == null || latestFrame.isRecycled()) return false;
-
-            // V0.5: FIT_CENTER rather than stretching/cropping the phone image to the eye box.
-            // This guarantees the whole captured phone screen remains visible with black bars where needed.
-            float srcW = latestFrame.getWidth();
-            float srcH = latestFrame.getHeight();
+            int srcW = Math.min(latestContentWidth, latestFrame.getWidth());
+            int srcH = Math.min(latestContentHeight, latestFrame.getHeight());
             if (srcW <= 0 || srcH <= 0 || bounds.width() <= 0 || bounds.height() <= 0) return false;
 
+            // FIT_CENTER guarantees the entire phone/game frame is visible in each eye.
             float scale = Math.min(bounds.width() / srcW, bounds.height() / srcH);
             float drawW = srcW * scale;
             float drawH = srcH * scale;
@@ -70,8 +79,8 @@ public class ScreenCaptureService extends Service {
                     cy - drawH / 2f,
                     cx + drawW / 2f,
                     cy + drawH / 2f);
-
-            canvas.drawBitmap(latestFrame, null, fitted, paint);
+            Rect src = new Rect(0, 0, srcW, srcH);
+            canvas.drawBitmap(latestFrame, src, fitted, paint);
             return true;
         }
     }
@@ -82,6 +91,18 @@ public class ScreenCaptureService extends Service {
         captureThread = new HandlerThread("lgr100-screen-capture");
         captureThread.start();
         captureHandler = new Handler(captureThread.getLooper());
+        displayManager = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+
+        displayListener = new DisplayManager.DisplayListener() {
+            @Override public void onDisplayAdded(int displayId) {}
+            @Override public void onDisplayRemoved(int displayId) {}
+            @Override public void onDisplayChanged(int displayId) {
+                if (displayId != Display.DEFAULT_DISPLAY || captureHandler == null || mediaProjection == null) return;
+                captureHandler.removeCallbacks(reconfigureRunnable);
+                captureHandler.postDelayed(reconfigureRunnable, 250);
+            }
+        };
+        displayManager.registerDisplayListener(displayListener, captureHandler);
     }
 
     @Override @SuppressWarnings("deprecation")
@@ -100,7 +121,7 @@ public class ScreenCaptureService extends Service {
 
         width = Math.max(2, intent.getIntExtra(EXTRA_WIDTH, 720));
         height = Math.max(2, intent.getIntExtra(EXTRA_HEIGHT, 1280));
-        int density = Math.max(120, intent.getIntExtra(EXTRA_DENSITY, 420));
+        density = Math.max(120, intent.getIntExtra(EXTRA_DENSITY, 420));
 
         if (resultCode != -1 || resultData == null) {
             stopSelf();
@@ -125,9 +146,7 @@ public class ScreenCaptureService extends Service {
             }
         }, captureHandler);
 
-        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
-        imageReader.setOnImageAvailableListener(this::onImageAvailable, captureHandler);
-
+        imageReader = makeImageReader(width, height);
         virtualDisplay = mediaProjection.createVirtualDisplay(
                 "LGR100 Phone Screen Capture",
                 width,
@@ -140,7 +159,53 @@ public class ScreenCaptureService extends Service {
 
         captureActive = virtualDisplay != null;
         if (!captureActive) stopSelf();
+        else captureHandler.postDelayed(reconfigureRunnable, 350);
         return START_NOT_STICKY;
+    }
+
+    private ImageReader makeImageReader(int w, int h) {
+        ImageReader reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2);
+        reader.setOnImageAvailableListener(this::onImageAvailable, captureHandler);
+        return reader;
+    }
+
+    @SuppressWarnings("deprecation")
+    private void reconfigureForCurrentPhoneDisplay() {
+        if (virtualDisplay == null || mediaProjection == null || displayManager == null) return;
+        Display phone = displayManager.getDisplay(Display.DEFAULT_DISPLAY);
+        if (phone == null) return;
+
+        DisplayMetrics dm = new DisplayMetrics();
+        phone.getRealMetrics(dm);
+        if (dm.widthPixels <= 1 || dm.heightPixels <= 1) return;
+
+        float scale = Math.min(1.0f, MAX_CAPTURE_LONG_EDGE / (float) Math.max(dm.widthPixels, dm.heightPixels));
+        int newW = Math.max(2, Math.round(dm.widthPixels * scale));
+        int newH = Math.max(2, Math.round(dm.heightPixels * scale));
+        int newDensity = Math.max(120, dm.densityDpi);
+
+        if (newW == width && newH == height && newDensity == density) return;
+
+        ImageReader oldReader = imageReader;
+        ImageReader newReader = makeImageReader(newW, newH);
+        try {
+            virtualDisplay.setSurface(null);
+            virtualDisplay.resize(newW, newH, newDensity);
+            virtualDisplay.setSurface(newReader.getSurface());
+            imageReader = newReader;
+            width = newW;
+            height = newH;
+            density = newDensity;
+            clearLatestFrame();
+            if (oldReader != null) {
+                try { oldReader.close(); } catch (Throwable ignored) {}
+            }
+        } catch (Throwable t) {
+            try { newReader.close(); } catch (Throwable ignored) {}
+            if (oldReader != null) {
+                try { virtualDisplay.setSurface(oldReader.getSurface()); } catch (Throwable ignored) {}
+            }
+        }
     }
 
     private void onImageAvailable(ImageReader reader) {
@@ -153,20 +218,21 @@ public class ScreenCaptureService extends Service {
             if (planes == null || planes.length == 0) return;
             Image.Plane plane = planes[0];
             ByteBuffer buffer = plane.getBuffer();
-            int pixelStride = plane.getPixelStride();
+            int pixelStride = Math.max(1, plane.getPixelStride());
             int rowStride = plane.getRowStride();
             int rowPadding = Math.max(0, rowStride - pixelStride * width);
-            int paddedWidth = width + rowPadding / Math.max(1, pixelStride);
-
-            Bitmap padded = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888);
-            padded.copyPixelsFromBuffer(buffer);
-            Bitmap cropped = Bitmap.createBitmap(padded, 0, 0, width, height);
-            if (cropped != padded) padded.recycle();
+            int paddedWidth = width + rowPadding / pixelStride;
+            buffer.rewind();
 
             synchronized (FRAME_LOCK) {
-                Bitmap old = latestFrame;
-                latestFrame = cropped;
-                if (old != null && old != cropped && !old.isRecycled()) old.recycle();
+                if (latestFrame == null || latestFrame.isRecycled()
+                        || latestFrame.getWidth() != paddedWidth || latestFrame.getHeight() != height) {
+                    if (latestFrame != null && !latestFrame.isRecycled()) latestFrame.recycle();
+                    latestFrame = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888);
+                }
+                latestFrame.copyPixelsFromBuffer(buffer);
+                latestContentWidth = width;
+                latestContentHeight = height;
             }
         } catch (Throwable ignored) {
         } finally {
@@ -174,14 +240,23 @@ public class ScreenCaptureService extends Service {
         }
     }
 
-    @Override public void onDestroy() {
-        captureActive = false;
-        stopProjectionObjects();
-
+    private static void clearLatestFrame() {
         synchronized (FRAME_LOCK) {
             if (latestFrame != null && !latestFrame.isRecycled()) latestFrame.recycle();
             latestFrame = null;
+            latestContentWidth = 0;
+            latestContentHeight = 0;
         }
+    }
+
+    @Override public void onDestroy() {
+        captureActive = false;
+        if (displayManager != null && displayListener != null) {
+            try { displayManager.unregisterDisplayListener(displayListener); } catch (Throwable ignored) {}
+        }
+        if (captureHandler != null) captureHandler.removeCallbacks(reconfigureRunnable);
+        stopProjectionObjects();
+        clearLatestFrame();
 
         if (captureThread != null) {
             captureThread.quitSafely();
@@ -218,7 +293,7 @@ public class ScreenCaptureService extends Service {
                     CHANNEL_ID,
                     "LG 360 VR screen sharing",
                     NotificationManager.IMPORTANCE_LOW);
-            channel.setDescription("Keeps phone-screen capture active for the LG 360 VR.");
+            channel.setDescription("Keeps low-latency phone/game capture active for the LG 360 VR.");
             NotificationManager nm = getSystemService(NotificationManager.class);
             nm.createNotificationChannel(channel);
         }
@@ -230,7 +305,7 @@ public class ScreenCaptureService extends Service {
                 : new Notification.Builder(this);
         return builder
                 .setContentTitle("LG 360 VR")
-                .setContentText("Sharing phone screen to the headset")
+                .setContentText("VR game screen is active")
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setOngoing(true)
                 .build();
