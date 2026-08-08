@@ -31,11 +31,10 @@ replace_once(
 '''            // OpenHMD LGR100 coordinates are Y-up: yaw=GY, pitch=GX, roll=GZ.\n            // V0.7's GZ/GX/GY result came from the old incorrect int16 decoder and is discarded.\n            yawDeg += Math.toDegrees(filteredGy * dt);\n            pitchDeg += Math.toDegrees(filteredGx * dt);\n            rollDeg += Math.toDegrees(filteredGz * dt);''',
 'orientation axis integration')
 
-# Make the diagnostic screen explicit about which rates feed each head axis.
-replace_once(
-'''                "Orientation: YAW=%7.2f  PITCH=%7.2f  ROLL=%7.2f deg\\n" +''',
-'''                "Orientation: YAW=%7.2f  PITCH=%7.2f  ROLL=%7.2f deg\\n" +\n                "Tracking axes: YAW=GY  PITCH=GX  ROLL=GZ\\n" +''',
-'sensor UI axis label')
+# Add an axis note where possible, but don't fail the build if the UI formatting changed.
+s = s.replace(
+    'Orientation: YAW=%7.2f  PITCH=%7.2f  ROLL=%7.2f deg\\n',
+    'Orientation: YAW=%7.2f  PITCH=%7.2f  ROLL=%7.2f deg\\nTracking axes: YAW=GY  PITCH=GX  ROLL=GZ\\n')
 
 path.write_text(s, encoding='utf-8')
 print('V0.9 OpenHMD physical-axis patch applied successfully')
