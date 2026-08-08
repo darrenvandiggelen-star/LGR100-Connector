@@ -6,12 +6,11 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
-import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
-import android.graphics.Rect;
 import android.graphics.RectF;
+import android.graphics.SurfaceTexture;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
 import android.media.Image;
@@ -24,8 +23,7 @@ import android.os.HandlerThread;
 import android.os.IBinder;
 import android.util.DisplayMetrics;
 import android.view.Display;
-
-import java.nio.ByteBuffer;
+import android.view.Surface;
 
 public class ScreenCaptureService extends Service {
     public static final String EXTRA_RESULT_CODE = "result_code";
@@ -36,24 +34,33 @@ public class ScreenCaptureService extends Service {
 
     private static final String CHANNEL_ID = "lgr100_screen_share";
     private static final int NOTIFICATION_ID = 360;
-    private static final Object FRAME_LOCK = new Object();
-    private static final int MAX_CAPTURE_LONG_EDGE = 1440;
 
-    private static Bitmap latestFrame;
-    private static int latestContentWidth;
-    private static int latestContentHeight;
+    // The headset is 960x720 per eye. Capturing above this for a fitted 2D game plane
+    // only wastes bandwidth and GPU/CPU time, especially on ultra-wide phone screens.
+    private static final int MAX_CAPTURE_LONG_EDGE = 960;
+
+    private static final Object INSTANCE_LOCK = new Object();
+    private static volatile ScreenCaptureService activeInstance;
+    private static volatile SurfaceTexture pendingGpuTexture;
     private static volatile boolean captureActive = false;
+    private static volatile boolean gpuCaptureActive = false;
+    private static volatile int captureWidth = 0;
+    private static volatile int captureHeight = 0;
 
     private MediaProjection mediaProjection;
     private VirtualDisplay virtualDisplay;
-    private ImageReader imageReader;
     private HandlerThread captureThread;
     private Handler captureHandler;
     private DisplayManager displayManager;
     private DisplayManager.DisplayListener displayListener;
+
     private int width;
     private int height;
     private int density;
+
+    private SurfaceTexture gpuTexture;
+    private Surface gpuSurface;
+    private ImageReader fallbackReader;
 
     private final Runnable reconfigureRunnable = this::reconfigureForCurrentPhoneDisplay;
 
@@ -61,37 +68,60 @@ public class ScreenCaptureService extends Service {
         return captureActive;
     }
 
-    public static boolean drawLatestFrame(Canvas canvas, RectF bounds, Paint paint) {
-        synchronized (FRAME_LOCK) {
-            if (latestFrame == null || latestFrame.isRecycled()) return false;
-            int srcW = Math.min(latestContentWidth, latestFrame.getWidth());
-            int srcH = Math.min(latestContentHeight, latestFrame.getHeight());
-            if (srcW <= 0 || srcH <= 0 || bounds.width() <= 0 || bounds.height() <= 0) return false;
+    public static boolean isGpuCaptureActive() {
+        return gpuCaptureActive;
+    }
 
-            // FIT_CENTER guarantees the entire phone/game frame is visible in each eye.
-            float scale = Math.min(bounds.width() / srcW, bounds.height() / srcH);
-            float drawW = srcW * scale;
-            float drawH = srcH * scale;
-            float cx = bounds.centerX();
-            float cy = bounds.centerY();
-            RectF fitted = new RectF(
-                    cx - drawW / 2f,
-                    cy - drawH / 2f,
-                    cx + drawW / 2f,
-                    cy + drawH / 2f);
-            Rect src = new Rect(0, 0, srcW, srcH);
-            canvas.drawBitmap(latestFrame, src, fitted, paint);
-            return true;
+    public static int getCaptureWidth() {
+        return captureWidth;
+    }
+
+    public static int getCaptureHeight() {
+        return captureHeight;
+    }
+
+    /**
+     * Called by the OpenGL renderer in the external-display Presentation. The MediaProjection
+     * producer then writes straight into this SurfaceTexture. No ImageReader -> ByteBuffer ->
+     * Bitmap copy is needed in gaming mode.
+     */
+    public static void attachGpuSurface(SurfaceTexture texture) {
+        if (texture == null) return;
+        ScreenCaptureService service;
+        synchronized (INSTANCE_LOCK) {
+            pendingGpuTexture = texture;
+            service = activeInstance;
         }
+        if (service != null) service.postAttachGpuSurface(texture);
+    }
+
+    public static void detachGpuSurface(SurfaceTexture texture) {
+        if (texture == null) return;
+        ScreenCaptureService service;
+        synchronized (INSTANCE_LOCK) {
+            if (pendingGpuTexture == texture) pendingGpuTexture = null;
+            service = activeInstance;
+        }
+        if (service != null) service.postDetachGpuSurface(texture);
+    }
+
+    /** Legacy Canvas fallback kept only so older generated views still compile. V1.1 uses GL. */
+    public static boolean drawLatestFrame(Canvas canvas, RectF bounds, Paint paint) {
+        return false;
     }
 
     @Override public void onCreate() {
         super.onCreate();
         createNotificationChannel();
-        captureThread = new HandlerThread("lgr100-screen-capture");
+
+        captureThread = new HandlerThread("lgr100-gpu-capture");
         captureThread.start();
         captureHandler = new Handler(captureThread.getLooper());
         displayManager = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+
+        synchronized (INSTANCE_LOCK) {
+            activeInstance = this;
+        }
 
         displayListener = new DisplayManager.DisplayListener() {
             @Override public void onDisplayAdded(int displayId) {}
@@ -99,7 +129,7 @@ public class ScreenCaptureService extends Service {
             @Override public void onDisplayChanged(int displayId) {
                 if (displayId != Display.DEFAULT_DISPLAY || captureHandler == null || mediaProjection == null) return;
                 captureHandler.removeCallbacks(reconfigureRunnable);
-                captureHandler.postDelayed(reconfigureRunnable, 250);
+                captureHandler.postDelayed(reconfigureRunnable, 120);
             }
         };
         displayManager.registerDisplayListener(displayListener, captureHandler);
@@ -119,9 +149,13 @@ public class ScreenCaptureService extends Service {
         if (Build.VERSION.SDK_INT >= 33) resultData = intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent.class);
         else resultData = intent.getParcelableExtra(EXTRA_RESULT_DATA);
 
-        width = Math.max(2, intent.getIntExtra(EXTRA_WIDTH, 720));
-        height = Math.max(2, intent.getIntExtra(EXTRA_HEIGHT, 1280));
+        int requestedW = Math.max(2, intent.getIntExtra(EXTRA_WIDTH, 720));
+        int requestedH = Math.max(2, intent.getIntExtra(EXTRA_HEIGHT, 1280));
+        int[] fitted = fitCaptureSize(requestedW, requestedH);
+        width = fitted[0];
+        height = fitted[1];
         density = Math.max(120, intent.getIntExtra(EXTRA_DENSITY, 420));
+        publishCaptureSize();
 
         if (resultCode != -1 || resultData == null) {
             stopSelf();
@@ -140,33 +174,126 @@ public class ScreenCaptureService extends Service {
         mediaProjection.registerCallback(new MediaProjection.Callback() {
             @Override public void onStop() {
                 captureActive = false;
+                gpuCaptureActive = false;
                 releaseDisplayObjects();
                 mediaProjection = null;
                 stopSelf();
             }
         }, captureHandler);
 
-        imageReader = makeImageReader(width, height);
+        // Start with a drain-only surface. The external GL renderer normally replaces this
+        // within a few hundred milliseconds. This avoids depending on null-Surface behaviour.
+        fallbackReader = makeDrainReader(width, height);
         virtualDisplay = mediaProjection.createVirtualDisplay(
-                "LGR100 Phone Screen Capture",
+                "LGR100 GPU Phone Capture",
                 width,
                 height,
                 density,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                imageReader.getSurface(),
+                fallbackReader.getSurface(),
                 null,
                 captureHandler);
 
         captureActive = virtualDisplay != null;
-        if (!captureActive) stopSelf();
-        else captureHandler.postDelayed(reconfigureRunnable, 350);
+        if (!captureActive) {
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
+        SurfaceTexture pending;
+        synchronized (INSTANCE_LOCK) {
+            pending = pendingGpuTexture;
+        }
+        if (pending != null) postAttachGpuSurface(pending);
+        captureHandler.postDelayed(reconfigureRunnable, 180);
         return START_NOT_STICKY;
     }
 
-    private ImageReader makeImageReader(int w, int h) {
+    private int[] fitCaptureSize(int rawW, int rawH) {
+        int w = Math.max(2, rawW);
+        int h = Math.max(2, rawH);
+        float scale = Math.min(1.0f, MAX_CAPTURE_LONG_EDGE / (float) Math.max(w, h));
+        // Keep dimensions even for broad Surface/encoder compatibility.
+        int outW = Math.max(2, (Math.round(w * scale) / 2) * 2);
+        int outH = Math.max(2, (Math.round(h * scale) / 2) * 2);
+        return new int[]{outW, outH};
+    }
+
+    private void publishCaptureSize() {
+        captureWidth = width;
+        captureHeight = height;
+    }
+
+    private ImageReader makeDrainReader(int w, int h) {
         ImageReader reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2);
-        reader.setOnImageAvailableListener(this::onImageAvailable, captureHandler);
+        reader.setOnImageAvailableListener(r -> {
+            Image image = null;
+            try {
+                image = r.acquireLatestImage();
+            } catch (Throwable ignored) {
+            } finally {
+                if (image != null) image.close();
+            }
+        }, captureHandler);
         return reader;
+    }
+
+    private void postAttachGpuSurface(SurfaceTexture texture) {
+        Handler h = captureHandler;
+        if (h == null) return;
+        h.post(() -> attachGpuSurfaceInternal(texture));
+    }
+
+    private void attachGpuSurfaceInternal(SurfaceTexture texture) {
+        if (texture == null || virtualDisplay == null) return;
+        if (gpuTexture == texture && gpuSurface != null) return;
+
+        releaseGpuSurfaceOnly();
+        gpuTexture = texture;
+        try {
+            gpuTexture.setDefaultBufferSize(width, height);
+            gpuSurface = new Surface(gpuTexture);
+            virtualDisplay.setSurface(gpuSurface);
+            gpuCaptureActive = true;
+
+            if (fallbackReader != null) {
+                try { fallbackReader.close(); } catch (Throwable ignored) {}
+                fallbackReader = null;
+            }
+        } catch (Throwable t) {
+            gpuCaptureActive = false;
+            releaseGpuSurfaceOnly();
+            ensureFallbackSurface();
+        }
+    }
+
+    private void postDetachGpuSurface(SurfaceTexture texture) {
+        Handler h = captureHandler;
+        if (h == null) return;
+        h.post(() -> {
+            if (gpuTexture != texture) return;
+            try { if (virtualDisplay != null) virtualDisplay.setSurface(null); } catch (Throwable ignored) {}
+            releaseGpuSurfaceOnly();
+            gpuCaptureActive = false;
+            ensureFallbackSurface();
+        });
+    }
+
+    private void releaseGpuSurfaceOnly() {
+        if (gpuSurface != null) {
+            try { gpuSurface.release(); } catch (Throwable ignored) {}
+            gpuSurface = null;
+        }
+        gpuTexture = null;
+    }
+
+    private void ensureFallbackSurface() {
+        if (virtualDisplay == null || fallbackReader != null) return;
+        try {
+            fallbackReader = makeDrainReader(width, height);
+            virtualDisplay.setSurface(fallbackReader.getSurface());
+        } catch (Throwable ignored) {
+        }
     }
 
     @SuppressWarnings("deprecation")
@@ -179,84 +306,50 @@ public class ScreenCaptureService extends Service {
         phone.getRealMetrics(dm);
         if (dm.widthPixels <= 1 || dm.heightPixels <= 1) return;
 
-        float scale = Math.min(1.0f, MAX_CAPTURE_LONG_EDGE / (float) Math.max(dm.widthPixels, dm.heightPixels));
-        int newW = Math.max(2, Math.round(dm.widthPixels * scale));
-        int newH = Math.max(2, Math.round(dm.heightPixels * scale));
+        int[] fitted = fitCaptureSize(dm.widthPixels, dm.heightPixels);
+        int newW = fitted[0];
+        int newH = fitted[1];
         int newDensity = Math.max(120, dm.densityDpi);
-
         if (newW == width && newH == height && newDensity == density) return;
 
-        ImageReader oldReader = imageReader;
-        ImageReader newReader = makeImageReader(newW, newH);
         try {
-            virtualDisplay.setSurface(null);
-            virtualDisplay.resize(newW, newH, newDensity);
-            virtualDisplay.setSurface(newReader.getSurface());
-            imageReader = newReader;
             width = newW;
             height = newH;
             density = newDensity;
-            clearLatestFrame();
-            if (oldReader != null) {
-                try { oldReader.close(); } catch (Throwable ignored) {}
-            }
-        } catch (Throwable t) {
-            try { newReader.close(); } catch (Throwable ignored) {}
-            if (oldReader != null) {
-                try { virtualDisplay.setSurface(oldReader.getSurface()); } catch (Throwable ignored) {}
-            }
-        }
-    }
+            publishCaptureSize();
 
-    private void onImageAvailable(ImageReader reader) {
-        Image image = null;
-        try {
-            image = reader.acquireLatestImage();
-            if (image == null) return;
+            if (gpuTexture != null) gpuTexture.setDefaultBufferSize(width, height);
+            virtualDisplay.resize(width, height, density);
 
-            Image.Plane[] planes = image.getPlanes();
-            if (planes == null || planes.length == 0) return;
-            Image.Plane plane = planes[0];
-            ByteBuffer buffer = plane.getBuffer();
-            int pixelStride = Math.max(1, plane.getPixelStride());
-            int rowStride = plane.getRowStride();
-            int rowPadding = Math.max(0, rowStride - pixelStride * width);
-            int paddedWidth = width + rowPadding / pixelStride;
-            buffer.rewind();
-
-            synchronized (FRAME_LOCK) {
-                if (latestFrame == null || latestFrame.isRecycled()
-                        || latestFrame.getWidth() != paddedWidth || latestFrame.getHeight() != height) {
-                    if (latestFrame != null && !latestFrame.isRecycled()) latestFrame.recycle();
-                    latestFrame = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888);
+            // If GL is not attached, the drain reader must match the new geometry.
+            if (gpuTexture == null) {
+                ImageReader old = fallbackReader;
+                fallbackReader = makeDrainReader(width, height);
+                virtualDisplay.setSurface(fallbackReader.getSurface());
+                if (old != null) {
+                    try { old.close(); } catch (Throwable ignored) {}
                 }
-                latestFrame.copyPixelsFromBuffer(buffer);
-                latestContentWidth = width;
-                latestContentHeight = height;
             }
         } catch (Throwable ignored) {
-        } finally {
-            if (image != null) image.close();
-        }
-    }
-
-    private static void clearLatestFrame() {
-        synchronized (FRAME_LOCK) {
-            if (latestFrame != null && !latestFrame.isRecycled()) latestFrame.recycle();
-            latestFrame = null;
-            latestContentWidth = 0;
-            latestContentHeight = 0;
         }
     }
 
     @Override public void onDestroy() {
         captureActive = false;
+        gpuCaptureActive = false;
+
+        synchronized (INSTANCE_LOCK) {
+            if (activeInstance == this) activeInstance = null;
+        }
+
         if (displayManager != null && displayListener != null) {
             try { displayManager.unregisterDisplayListener(displayListener); } catch (Throwable ignored) {}
         }
         if (captureHandler != null) captureHandler.removeCallbacks(reconfigureRunnable);
         stopProjectionObjects();
-        clearLatestFrame();
+
+        captureWidth = 0;
+        captureHeight = 0;
 
         if (captureThread != null) {
             captureThread.quitSafely();
@@ -268,14 +361,18 @@ public class ScreenCaptureService extends Service {
 
     private void releaseDisplayObjects() {
         captureActive = false;
+        gpuCaptureActive = false;
+
         if (virtualDisplay != null) {
+            try { virtualDisplay.setSurface(null); } catch (Throwable ignored) {}
             try { virtualDisplay.release(); } catch (Throwable ignored) {}
             virtualDisplay = null;
         }
-        if (imageReader != null) {
-            try { imageReader.close(); } catch (Throwable ignored) {}
-            imageReader = null;
+        if (fallbackReader != null) {
+            try { fallbackReader.close(); } catch (Throwable ignored) {}
+            fallbackReader = null;
         }
+        releaseGpuSurfaceOnly();
     }
 
     private void stopProjectionObjects() {
@@ -293,7 +390,7 @@ public class ScreenCaptureService extends Service {
                     CHANNEL_ID,
                     "LG 360 VR screen sharing",
                     NotificationManager.IMPORTANCE_LOW);
-            channel.setDescription("Keeps low-latency phone/game capture active for the LG 360 VR.");
+            channel.setDescription("Keeps GPU phone/game capture active for the LG 360 VR.");
             NotificationManager nm = getSystemService(NotificationManager.class);
             nm.createNotificationChannel(channel);
         }
@@ -305,7 +402,7 @@ public class ScreenCaptureService extends Service {
                 : new Notification.Builder(this);
         return builder
                 .setContentTitle("LG 360 VR")
-                .setContentText("VR game screen is active")
+                .setContentText("GPU VR game screen is active")
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setOngoing(true)
                 .build();
