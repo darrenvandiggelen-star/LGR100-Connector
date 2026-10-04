@@ -108,6 +108,12 @@ jobs:
           for old, new in replacements.items():
               assert old in g, old
               g = g.replace(old, new, 1)
+          dep = '''tasks.named("preBuild") {
+              dependsOn(qnnStage)
+          }'''
+          assert dep in g
+          g = g.replace(dep, '''// LiveMorph CI supplies the exact matching prebuilt native runtime.
+          // Do not demand a local Qualcomm SDK just to rebuild Kotlin/UI resources.''', 1)
           gradle.write_text(g)
 
           comp = root / "app/src/main/java/com/facefusion/mobile/ui/Components.kt"
